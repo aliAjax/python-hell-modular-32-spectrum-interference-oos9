@@ -2,7 +2,7 @@ import json
 import mimetypes
 import os
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from .domain import DomainError
 
@@ -46,10 +46,14 @@ def build_handler(service, static_dir):
         def do_GET(self):
             try:
                 path = urlparse(self.path).path
+                query = {k: values[0] for k, values in parse_qs(urlparse(self.path).query).items()}
+                actor, role, region = self._identity()
                 if path == "/health":
                     return self._send(200, {"status": "ok"})
                 if path == "/api/state":
                     return self._send(200, service.state())
+                if path == "/api/delegations":
+                    return self._send(200, {"delegations": service.list_delegations(actor, role, region, query.get("grantee"))})
                 if path == "/api/items":
                     return self._send(200, {"items": service.list_items()})
                 parts = [part for part in path.split("/") if part]
@@ -74,8 +78,11 @@ def build_handler(service, static_dir):
             try:
                 actor, role, region = self._identity()
                 path = urlparse(self.path).path
+                query = {k: values[0] for k, values in parse_qs(urlparse(self.path).query).items()}
                 payload = self._json_body()
                 parts = [part for part in path.split("/") if part]
+                if parts == ["api", "delegations"]:
+                    return self._send(201, service.grant_delegation(payload, actor, role, region))
                 if parts == ["api", "items"]:
                     return self._send(201, service.create_item(payload, actor, role, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":

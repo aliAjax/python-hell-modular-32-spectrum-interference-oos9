@@ -2,8 +2,9 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+from . import rules
 from .audit import audit_hash, canonical_json
-from .domain import ConflictError, NotFoundError, DomainError
+from .domain import ConflictError, DomainError, NotFoundError, normalize_utc
 
 
 def now_iso():
@@ -46,9 +47,36 @@ class Repository:
                     payload TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    superseded_at TEXT,
                     UNIQUE(item_id, source_type, external_id),
                     FOREIGN KEY(item_id) REFERENCES items(id)
                 );
+                CREATE TABLE IF NOT EXISTS source_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    replaced_at TEXT NOT NULL,
+                    replaced_by TEXT,
+                    replace_role TEXT,
+                    FOREIGN KEY(source_id) REFERENCES sources(id)
+                );
+                CREATE TABLE IF NOT EXISTS delegations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    grantee TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    item_id INTEGER,
+                    expires_at TEXT NOT NULL,
+                    note TEXT,
+                    created_by TEXT NOT NULL,
+                    created_role TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    revoke_reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_delegations_lookup
+                    ON delegations(grantee, region, revoked_at, expires_at);
                 CREATE TABLE IF NOT EXISTS actions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER NOT NULL,
@@ -160,31 +188,114 @@ class Repository:
         finally:
             conn.close()
 
-    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role):
+    def add_source(self, item_id, record, actor, role):
+        """登记来源测量。同一 (source_type, external_id) 的重复回传在单个事务内完成
+        取舍、留痕、基准重算和事件版本推进。"""
+        source_type = record["source_type"]
+        external_id = record["external_id"]
+        observed_at = normalize_utc(record["observed_at"], "observed_at")
+        strength = float(record["strength_dbm"])
+        source_payload = {
+            "strength_dbm": strength,
+            "region": record.get("region"),
+            "station_id": record.get("station_id"),
+            "frequency_mhz": record.get("frequency_mhz"),
+        }
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            item = conn.execute("SELECT id FROM items WHERE id=?", (item_id,)).fetchone()
-            if item is None:
+            item_row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if item_row is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
-            try:
+            existing = conn.execute(
+                "SELECT * FROM sources WHERE item_id=? AND source_type=? AND external_id=?",
+                (item_id, source_type, external_id),
+            ).fetchone()
+            existing_dict = None
+            if existing is not None:
+                existing_dict = dict(existing)
+                existing_dict["payload"] = json.loads(existing["payload"])
+            decision = rules.decide_source(
+                existing_dict,
+                observed_at,
+                strength,
+            )
+            recorded_at = now_iso()
+            change = None
+            if decision == "insert":
                 conn.execute(
                     "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?)",
-                    (item_id, source_type, external_id, canonical_json(payload), observed_at, now_iso()),
+                    (item_id, source_type, external_id, canonical_json(source_payload), observed_at, recorded_at),
                 )
-            except sqlite3.IntegrityError:
-                raise ConflictError("duplicate_source", "同一来源记录已经提交")
-            source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-            self.append_audit(
-                conn,
-                item_id,
-                "source_recorded",
+                source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                self.append_audit(
+                    conn, item_id, "source_recorded", actor, role,
+                    {"source_id": source_id, "source_type": source_type, "external_id": external_id,
+                     "observed_at": observed_at, "strength_dbm": strength},
+                )
+            elif decision == "ignored":
+                source_id = existing["id"]
+                self.append_audit(
+                    conn, item_id, "source_deduplicated", actor, role,
+                    {"source_id": source_id, "source_type": source_type, "external_id": external_id,
+                     "observed_at": observed_at, "strength_dbm": strength},
+                )
+            else:
+                source_id = existing["id"]
+                old_payload = json.loads(existing["payload"])
+                old_observed = existing["observed_at"]
+                conn.execute(
+                    "INSERT INTO source_revisions(source_id,item_id,payload,observed_at,replaced_at,replaced_by,replace_role) VALUES(?,?,?,?,?,?,?)",
+                    (source_id, item_id, canonical_json(old_payload), old_observed, recorded_at, actor, role),
+                )
+                conn.execute(
+                    "UPDATE sources SET payload=?, observed_at=?, superseded_at=? WHERE id=?",
+                    (canonical_json(source_payload), observed_at, recorded_at, source_id),
+                )
+                self.append_audit(
+                    conn, item_id, "source_superseded", actor, role,
+                    {"source_id": source_id, "source_type": source_type, "external_id": external_id,
+                     "old": {"strength_dbm": old_payload.get("strength_dbm"), "observed_at": old_observed},
+                     "new": {"strength_dbm": strength, "observed_at": observed_at},
+                     "replaced_at": recorded_at},
+                )
+
+            # 以全部来源的当前测量重算事件基准
+            source_rows = conn.execute("SELECT * FROM sources WHERE item_id=? ORDER BY id", (item_id,)).fetchall()
+            sources = []
+            for row in source_rows:
+                value = dict(row)
+                value["payload"] = json.loads(value["payload"])
+                sources.append(value)
+            payload = json.loads(item_row["payload"])
+            change = rules.recompute_baseline(
+                payload,
+                item_row["status"],
+                sources,
+                item_row["created_at"],
+                recorded_at,
                 actor,
                 role,
-                {"source_id": source_id, "source_type": source_type, "external_id": external_id},
+                "来源测量更新（source_type=%s, external_id=%s）" % (source_type, external_id),
             )
+            if change is not None:
+                version = int(item_row["version"]) + 1
+                conn.execute(
+                    "UPDATE items SET payload=?, version=?, updated_at=? WHERE id=?",
+                    (canonical_json(payload), version, recorded_at, item_id),
+                )
+                self.append_audit(conn, item_id, "baseline_updated", actor, role, change)
             conn.execute("COMMIT")
-            return {"id": source_id, "item_id": item_id, "source_type": source_type, "external_id": external_id, "payload": payload, "observed_at": observed_at}
+            return {
+                "id": source_id,
+                "item_id": item_id,
+                "source_type": source_type,
+                "external_id": external_id,
+                "payload": source_payload,
+                "observed_at": observed_at,
+                "outcome": decision,
+                "baseline_change": change,
+            }
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -198,10 +309,19 @@ class Repository:
         conn = self.connect()
         try:
             rows = conn.execute("SELECT * FROM sources WHERE item_id=? ORDER BY id DESC", (item_id,)).fetchall()
+            revision_rows = conn.execute(
+                "SELECT * FROM source_revisions WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+            revisions_by_source = {}
+            for row in revision_rows:
+                value = dict(row)
+                value["payload"] = json.loads(value["payload"])
+                revisions_by_source.setdefault(value["source_id"], []).append(value)
             result = []
             for row in rows:
                 value = dict(row)
                 value["payload"] = json.loads(value["payload"])
+                value["revisions"] = revisions_by_source.get(value["id"], [])
                 result.append(value)
             return result
         finally:
@@ -247,6 +367,105 @@ class Repository:
                 value["payload"] = json.loads(value["payload"])
                 result.append(value)
             return result
+        finally:
+            conn.close()
+
+    def expire_due_delegations(self, at=None):
+        """到期代管授权自动收回（惰性执行：查询前先把到期记录标记收回）。"""
+        at = at or now_iso()
+        conn = self.connect()
+        try:
+            conn.execute(
+                "UPDATE delegations SET revoked_at=?, revoke_reason='expired' "
+                "WHERE revoked_at IS NULL AND expires_at<=?",
+                (at, at),
+            )
+        finally:
+            conn.close()
+
+    def create_delegation(self, delegation, actor, role):
+        self.expire_due_delegations()
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            created_at = now_iso()
+            conn.execute(
+                "INSERT INTO delegations(grantee,region,item_id,expires_at,note,created_by,created_role,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    delegation["grantee"],
+                    delegation["region"],
+                    delegation["item_id"],
+                    delegation["expires_at"],
+                    delegation["note"],
+                    actor,
+                    role,
+                    created_at,
+                ),
+            )
+            delegation_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            self.append_audit(
+                conn,
+                delegation["item_id"],
+                "delegation_granted",
+                actor,
+                role,
+                {
+                    "delegation_id": delegation_id,
+                    "grantee": delegation["grantee"],
+                    "region": delegation["region"],
+                    "expires_at": delegation["expires_at"],
+                },
+            )
+            conn.execute("COMMIT")
+            return self.get_delegation(delegation_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def get_delegation(self, delegation_id):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT * FROM delegations WHERE id=?", (delegation_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("delegation_not_found", "代管授权不存在")
+            return dict(row)
+        finally:
+            conn.close()
+
+    def find_active_delegation(self, grantee, region, item_id=None, at=None):
+        self.expire_due_delegations(at)
+        conn = self.connect()
+        try:
+            at_value = at or now_iso()
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE grantee=? AND region=? AND revoked_at IS NULL AND expires_at>? "
+                "AND (item_id IS NULL OR item_id=?) ORDER BY expires_at ASC, id ASC LIMIT 1",
+                (grantee, region, at_value, item_id),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def list_delegations(self, grantee=None, region=None):
+        self.expire_due_delegations()
+        conn = self.connect()
+        try:
+            sql = "SELECT * FROM delegations WHERE 1=1"
+            params = []
+            if grantee is not None:
+                sql += " AND grantee=?"
+                params.append(grantee)
+            if region is not None:
+                sql += " AND region=?"
+                params.append(region)
+            sql += " ORDER BY id DESC"
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
         finally:
             conn.close()
 

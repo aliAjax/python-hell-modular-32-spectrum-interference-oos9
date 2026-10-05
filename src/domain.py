@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class DomainError(Exception):
@@ -42,11 +42,23 @@ def number(payload, name, minimum=None, maximum=None):
 
 def parse_timestamp(payload, name):
     value = require_text(payload, name)
+    parse_dt(value, name)
+    return value
+
+
+def parse_dt(value, name="时间"):
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         raise DomainError("invalid_timestamp", "%s 必须是 ISO 时间" % name)
-    return value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def normalize_utc(value, name="时间"):
+    """归一化为 UTC ISO 字符串，保证字典序与时间序一致。"""
+    return parse_dt(value, name).astimezone(timezone.utc).isoformat()
 
 
 def normalize_create(payload):
@@ -64,9 +76,11 @@ def normalize_create(payload):
         "station_id": station_id,
         "region": region,
         "strength_dbm": strength,
+        "initial_strength_dbm": strength,
         "detected_at": detected_at,
         "reporter": reporter,
         "measurement_revisions": [],
+        "baseline_basis": {"ref": "creation", "observed_at": detected_at},
         "suspend_authorization": None,
         "_stable_key": stable_key,
     }
@@ -80,12 +94,38 @@ def normalize_source(payload):
     region = payload.get("region")
     if region is not None:
         region = str(region).strip() or None
+    station_id = payload.get("station_id")
+    if station_id is not None:
+        station_id = str(station_id).strip() or None
+    frequency = payload.get("frequency_mhz")
     return {
         "source_type": source_type,
         "external_id": external_id,
         "observed_at": observed_at,
         "strength_dbm": strength,
         "region": region,
-        "station_id": payload.get("station_id"),
-        "frequency_mhz": payload.get("frequency_mhz"),
+        "station_id": station_id,
+        "frequency_mhz": frequency,
+    }
+
+
+def normalize_delegation(payload):
+    grantee = require_text(payload, "grantee")
+    region = require_text(payload, "region")
+    expires_at = normalize_utc(require_text(payload, "expires_at"), "expires_at")
+    note = payload.get("note")
+    if note is not None:
+        note = str(note).strip() or None
+    item_id = payload.get("item_id")
+    if item_id is not None:
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            raise DomainError("invalid_item_id", "item_id 必须是整数")
+    return {
+        "grantee": grantee,
+        "region": region,
+        "expires_at": expires_at,
+        "item_id": item_id,
+        "note": note,
     }
