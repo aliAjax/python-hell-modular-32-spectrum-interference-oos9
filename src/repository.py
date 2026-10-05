@@ -2,6 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+from . import rules
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
 
@@ -46,6 +47,7 @@ class Repository:
                     payload TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
                     UNIQUE(item_id, source_type, external_id),
                     FOREIGN KEY(item_id) REFERENCES items(id)
                 );
@@ -72,6 +74,9 @@ class Repository:
                 );
                 """
             )
+            source_cols = [row["name"] for row in conn.execute("PRAGMA table_info(sources)")]
+            if "version" not in source_cols:
+                conn.execute("ALTER TABLE sources ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
         finally:
             conn.close()
 
@@ -160,31 +165,120 @@ class Repository:
         finally:
             conn.close()
 
-    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role):
+    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role, expected_version=None):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            item = conn.execute("SELECT id FROM items WHERE id=?", (item_id,)).fetchone()
+            item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
             if item is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
-            try:
+            row = conn.execute(
+                "SELECT * FROM sources WHERE item_id=? AND source_type=? AND external_id=?",
+                (item_id, source_type, external_id),
+            ).fetchone()
+            existing = None
+            if row is not None:
+                existing = {
+                    "strength_dbm": json.loads(row["payload"]).get("strength_dbm"),
+                    "observed_at": row["observed_at"],
+                    "version": row["version"],
+                }
+            decision = rules.plan_source_change(
+                existing,
+                {"strength_dbm": payload.get("strength_dbm"), "observed_at": observed_at},
+                expected_version,
+            )
+            op = decision["op"]
+            if op == "conflict":
+                if decision.get("status") == 400:
+                    raise DomainError(decision["code"], decision["message"], 400)
+                raise ConflictError(decision["code"], decision["message"])
+
+            if op == "insert":
                 conn.execute(
-                    "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at,version) VALUES(?,?,?,?,?,?,1)",
                     (item_id, source_type, external_id, canonical_json(payload), observed_at, now_iso()),
                 )
-            except sqlite3.IntegrityError:
-                raise ConflictError("duplicate_source", "同一来源记录已经提交")
-            source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-            self.append_audit(
-                conn,
-                item_id,
-                "source_recorded",
-                actor,
-                role,
-                {"source_id": source_id, "source_type": source_type, "external_id": external_id},
-            )
+                source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                source_version = 1
+                self.append_audit(
+                    conn,
+                    item_id,
+                    "source_recorded",
+                    actor,
+                    role,
+                    {"source_id": source_id, "source_type": source_type, "external_id": external_id},
+                )
+            elif op == "noop":
+                source_id = row["id"]
+                source_version = row["version"]
+                self.append_audit(
+                    conn,
+                    item_id,
+                    "source_duplicate",
+                    actor,
+                    role,
+                    {"source_id": source_id, "source_type": source_type, "external_id": external_id, "same_strength": True},
+                )
+            else:
+                source_id = row["id"]
+                source_version = row["version"] + 1
+                conn.execute(
+                    "UPDATE sources SET payload=?, observed_at=?, version=? WHERE id=?",
+                    (canonical_json(payload), observed_at, source_version, source_id),
+                )
+                self.append_audit(
+                    conn,
+                    item_id,
+                    "source_replaced",
+                    actor,
+                    role,
+                    {
+                        "source_id": source_id,
+                        "source_type": source_type,
+                        "external_id": external_id,
+                        "old_strength_dbm": existing["strength_dbm"],
+                        "old_observed_at": existing["observed_at"],
+                        "new_strength_dbm": payload.get("strength_dbm"),
+                        "new_observed_at": observed_at,
+                    },
+                )
+
+            sources = []
+            for source_row in conn.execute("SELECT * FROM sources WHERE item_id=?", (item_id,)).fetchall():
+                source_value = dict(source_row)
+                source_value["payload"] = json.loads(source_value["payload"])
+                sources.append(source_value)
+            current_payload = json.loads(item["payload"])
+            baseline_changed, baseline_info = rules.recompute_baseline(current_payload, sources, item["status"])
+            if baseline_changed:
+                conn.execute(
+                    "UPDATE items SET payload=?, version=?, updated_at=? WHERE id=?",
+                    (canonical_json(current_payload), item["version"] + 1, now_iso(), item_id),
+                )
+                self.append_audit(conn, item_id, "baseline_changed", actor, role, baseline_info)
+                if baseline_info.get("review_required"):
+                    self.append_audit(
+                        conn,
+                        item_id,
+                        "review_required",
+                        actor,
+                        role,
+                        {"reason": "baseline_changed", "status": item["status"]},
+                    )
+
             conn.execute("COMMIT")
-            return {"id": source_id, "item_id": item_id, "source_type": source_type, "external_id": external_id, "payload": payload, "observed_at": observed_at}
+            return {
+                "id": source_id,
+                "item_id": item_id,
+                "source_type": source_type,
+                "external_id": external_id,
+                "payload": payload,
+                "observed_at": observed_at,
+                "version": source_version,
+                "op": op,
+                "baseline": baseline_info if baseline_changed else None,
+            }
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -228,6 +322,44 @@ class Repository:
             self.append_audit(conn, item_id, action, actor, role, event_payload)
             conn.execute("COMMIT")
             return self.get_item(item_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def mark_delegation_revoked(self, item_id, delegation_id, reason="expired"):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            current = json.loads(row["payload"])
+            revoked = None
+            for delegation in current.get("delegations", []):
+                if delegation.get("id") == delegation_id and not delegation.get("revoked_at"):
+                    delegation["revoked_at"] = now_iso()
+                    delegation["revoke_reason"] = reason
+                    revoked = delegation
+            if revoked is not None:
+                conn.execute(
+                    "UPDATE items SET payload=?, updated_at=? WHERE id=?",
+                    (canonical_json(current), now_iso(), item_id),
+                )
+                self.append_audit(
+                    conn,
+                    item_id,
+                    "delegation_revoked",
+                    row["created_by"],
+                    row["created_role"],
+                    {"delegation_id": delegation_id, "actor": revoked.get("actor"), "region": revoked.get("region"), "reason": reason},
+                )
+            conn.execute("COMMIT")
+            return revoked
         except Exception:
             try:
                 conn.execute("ROLLBACK")

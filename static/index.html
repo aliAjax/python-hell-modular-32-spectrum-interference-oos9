@@ -1,5 +1,9 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无线电频谱干扰调查</title><body><h1>无线电频谱干扰调查与协调</h1><p>使用 JSON API 创建干扰事件、记录来源、定位和执行处置动作。</p><pre>GET /health
-GET /api/state
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无线电频谱干扰调查</title><body><h1>无线电频谱干扰调查与协调</h1><p>使用 JSON API 创建干扰事件、记录来源、定位和执行处置动作。</p><pre>GET  /health
+GET  /api/state
+GET  /api/items
+GET  /api/items/{id}
 POST /api/items
-POST /api/items/{id}/sources
-POST /api/items/{id}/actions</pre></body></html>
+POST /api/items/{id}/sources      补录测量；同源(type+external_id)只留一条，观测更晚者为准，被替记录入审计
+                                   更新已有来源需在请求体带 expected_version，并发冲突返回 409
+POST /api/items/{id}/actions      assess / locate / suspend / coordinate / resolve / correct_measurement / delegate / cancel
+GET  /api/items/{id}/audit</pre><p>测量记录是事件基准的依据：基准随最新观测重算，评估等级自动重算；事件已定位或处置中时，基准变化会置 <code>review_required</code> 提示复核。跨区处置需对方协调人 <code>delegate</code> 代管授权，到期自动收回。</p></body></html>

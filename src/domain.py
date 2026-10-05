@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class DomainError(Exception):
@@ -43,10 +43,12 @@ def number(payload, name, minimum=None, maximum=None):
 def parse_timestamp(payload, name):
     value = require_text(payload, name)
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         raise DomainError("invalid_timestamp", "%s 必须是 ISO 时间" % name)
-    return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def normalize_create(payload):
@@ -66,8 +68,12 @@ def normalize_create(payload):
         "strength_dbm": strength,
         "detected_at": detected_at,
         "reporter": reporter,
+        "baseline_observed_at": detected_at,
+        "baseline_source_id": None,
         "measurement_revisions": [],
         "suspend_authorization": None,
+        "delegations": [],
+        "review_required": False,
         "_stable_key": stable_key,
     }
 
@@ -88,4 +94,21 @@ def normalize_source(payload):
         "region": region,
         "station_id": payload.get("station_id"),
         "frequency_mhz": payload.get("frequency_mhz"),
+    }
+
+
+def normalize_delegate(payload):
+    delegate_to = require_text(payload, "delegate_to")
+    delegate_region = require_text(payload, "delegate_region")
+    expires_at = parse_timestamp(payload, "expires_at")
+    scope = payload.get("scope")
+    if scope is not None:
+        if not isinstance(scope, list) or not all(isinstance(item, str) and item.strip() for item in scope):
+            raise DomainError("invalid_scope", "scope 必须是非空字符串列表")
+        scope = [item.strip() for item in scope]
+    return {
+        "delegate_to": delegate_to,
+        "delegate_region": delegate_region,
+        "expires_at": expires_at,
+        "scope": scope,
     }

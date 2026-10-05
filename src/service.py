@@ -24,7 +24,14 @@ class Service:
             raise DomainError("forbidden", "当前角色不能提交来源记录", 403)
         item = self.repository.get_item(item_id)
         normalized = domain.normalize_source(payload)
-        if region and rules.ENFORCE_REGION and role != "regulator" and normalized.get("region") and normalized["region"] != region:
+        if (
+            region
+            and rules.ENFORCE_REGION
+            and role != "regulator"
+            and normalized.get("region")
+            and normalized["region"] != region
+            and not self._region_allowed(item, actor, region)
+        ):
             raise DomainError("region_mismatch", "来源记录不属于当前管辖区域", 403)
         result = self.repository.add_source(
             item_id,
@@ -34,8 +41,25 @@ class Service:
             normalized.pop("observed_at"),
             actor,
             role,
+            payload.get("expected_version"),
         )
         return result
+
+    def _region_allowed(self, item, actor, region, action=None):
+        if not region:
+            return True
+        payload = item.get("payload", {})
+        if payload.get("region") == region:
+            return True
+        delegation, state = rules.find_delegation(item, actor, region)
+        if state == "active":
+            scope = delegation.get("scope")
+            if scope and action and action not in scope:
+                return False
+            return True
+        if state == "expired":
+            self.repository.mark_delegation_revoked(item["id"], delegation["id"], "expired")
+        return False
 
     def act(self, item_id, action, payload, actor, role, expected_version=None, region=None):
         if not actor or not role:
@@ -45,7 +69,7 @@ class Service:
         if role not in allowed:
             raise DomainError("forbidden", "当前角色不能执行该操作", 403)
         if rules.ENFORCE_REGION and action in rules.REGION_SENSITIVE_ACTIONS and region and role != "regulator":
-            if item["payload"].get("region") != region:
+            if not self._region_allowed(item, actor, region, action):
                 raise DomainError("region_mismatch", "不能处理其他区域的记录", 403)
         if action in rules.ACTION_REQUIRES_VERSION and expected_version is None:
             raise DomainError("expected_version_required", "该操作需要 expected_version", 400)
